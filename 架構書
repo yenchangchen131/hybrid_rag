@@ -1,0 +1,184 @@
+這是一份針對您的需求量身打造的 **Hybrid RAG (Retrieval-Augmented Generation) 系統架構書**。
+
+這個架構結合了 **語意搜尋 (Vector Search)** 與 **關鍵字搜尋 (Keyword Search)**，並使用 MongoDB 作為統一的資料儲存與檢索後端，最後使用 DRCD 資料集的 10 筆資料進行驗證。
+
+---
+
+# Hybrid RAG 系統架構設計書
+
+## 1. 專案概述
+
+* **目標**：建立一個混合檢索增強生成系統，提升問答準確度。
+* **核心策略**：Hybrid Search (混合檢索) = 語意理解 (Dense Vector) + 精確匹配 (Sparse/Keyword)。
+* **資料集**：DRCD (Delta Reading Comprehension Dataset)，繁體中文閱讀理解資料集。
+* **資料庫**：MongoDB (建議使用 MongoDB Atlas 以支援 Vector Search)。
+* **驗證方式**：挑選 10 組 QAC (Question, Answer, Context) 進行端對端測試。
+
+---
+
+## 2. 技術堆疊 (Tech Stack)
+
+| 組件 | 技術選型 | 說明 |
+| --- | --- | --- |
+| **程式語言** | Python 3.10+ | 主流 AI 開發語言 |
+| **資料庫** | **MongoDB (Atlas)** | 同時支援 Vector Search 與 Text Search (Lucene) |
+| **Embedding 模型** | OpenAI `text-embedding-3-small` 或 BGE-M3 | 需支援繁體中文的優質 Embedding 模型 |
+| **LLM** | GPT-4o / GPT-3.5-turbo | 負責最後的回答生成 |
+| **Orchestration** | LangChain / LlamaIndex (或原生 Python) | 控制檢索與生成的流程 |
+| **評估指標** | Hit Rate, Answer Relevance | 基於 10 題 QAC 的人工或自動評分 |
+
+---
+
+## 3. 系統架構圖 (System Workflow)
+
+以下是資料流與處理邏輯的架構視圖：
+
+```mermaid
+graph TD
+    subgraph "Data Preparation (Offline)"
+        A[DRCD Dataset] --> B[Data Loader]
+        B --> C[Text Chunking]
+        C --> D[Embedding Model]
+        C --> E["Keyword Extraction/Tokenization"]
+        D --> F[(MongoDB Atlas)]
+        E --> F
+    end
+
+    subgraph "RAG Inference (Online)"
+        User[User Query] --> G[Query Pre-processing]
+        
+        %% Hybrid Retrieval Paths
+        G --> H{Hybrid Retrieval}
+        H -->|"Path 1: Semantic"| I["Vector Search (Dense)"]
+        H -->|"Path 2: Keyword"| J["Keyword Search (Sparse/BM25)"]
+        
+        %% Fusion
+        I --> K["Reranking / Fusion (Reciprocal Rank Fusion)"]
+        J --> K
+        
+        %% Generation
+        K --> L[Top-K Contexts]
+        L --> M[Prompt Construction]
+        User --> M
+        M --> N[LLM]
+        N --> O[Final Answer]
+    end
+```
+
+---
+
+## 4. 資料庫設計 (MongoDB Schema)
+
+為了支援混合檢索，我們需要在 MongoDB 中設計一個能夠同時儲存文本、向量和元數據的 Schema。
+
+**Collection 名稱**: `drcd_knowledge_base`
+
+```json
+{
+  "_id": "ObjectId(...)", 
+  "doc_id": "DRCD原始ID (例如: 1001)",
+  "text": "這是文章的內文段落...",
+  "embedding": [0.012, -0.045, ...],  // 向量資料 (Dense Vector)
+  "metadata": {
+    "title": "文章標題",
+    "source": "DRCD_train",
+    "split_id": 0 // 若有切分段落，標記順序
+  },
+  "keywords": ["關鍵字1", "關鍵字2"] // 選項：若不使用 Atlas Search 的全文檢索，可自行維護關鍵字欄位
+}
+
+```
+
+### 索引規劃 (Index Plan)
+
+1. **Vector Search Index**: 用於 Cosine Similarity 搜尋。
+2. **Search Index (Atlas Search)** 或 **Text Index**: 用於 BM25 或關鍵字匹配。
+
+---
+
+## 5. 核心模組詳細說明
+
+### A. 資料處理與入庫 (Data Ingestion)
+
+1. **資料來源**: 下載 DRCD 資料集 (JSON 格式)。
+2. **前處理**: 解析 JSON，提取 `context` (內文)。由於 DRCD 的段落長度適中，通常不需要過度切分 (Chunking)，若段落過長可設為 500 tokens 一切。
+3. **向量化**: 將 `context` 丟入 Embedding Model 取得向量。
+4. **儲存**: 將 `text`, `embedding` 存入 MongoDB。
+
+### B. 混合檢索邏輯 (Hybrid Retrieval Strategy)
+
+這是本系統的核心，當用戶輸入問題時：
+
+1. **路徑一 (Vector Search)**:
+* 將問題轉為向量。
+* 查詢 MongoDB Vector Index，取回 Top-10 相似文件。
+* *優點*：解決語意相似但用詞不同的問題。
+
+
+2. **路徑二 (Keyword Search)**:
+* 使用 MongoDB Atlas Search (Lucene) 或 Text Search 針對問題關鍵字進行查詢。
+* 取回 Top-10 關鍵字匹配文件。
+* *優點*：解決專有名詞精確匹配的問題。
+
+
+3. **融合 (Fusion - RRF)**:
+* 使用 **Reciprocal Rank Fusion (RRF)** 演算法將兩路結果合併並重新排序。
+* 公式概念：`Score = 1 / (k + rank_vector) + 1 / (k + rank_keyword)`
+* 選出最終 Top-3 到 Top-5 的段落。
+
+
+
+### C. 生成與回答 (Generation)
+
+1. **Prompt Template**:
+```text
+你是一個專業的繁體中文問答助手。請根據以下的參考資訊回答使用者的問題。如果參考資訊不足以回答，請說不知道。
+
+參考資訊：
+{context_str}
+
+使用者問題：
+{query_str}
+
+```
+
+
+2. **LLM**: 呼叫 API 生成最終答案。
+
+---
+
+## 6. 驗證計畫 (Evaluation Plan)
+
+我們將從 DRCD 中手動或隨機挑選 10 筆資料作為「驗證集 (Validation Set)」，不參與入庫，僅用於測試。
+
+**資料結構 (Excel/CSV 格式):**
+
+| ID | Question (Q) | Expected Answer (A) | Ground Truth Context (C) |
+| --- | --- | --- | --- |
+| 1 | 颱風的形成條件是什麼？ | 溫暖的海水與足夠的科里奧利力... | (對應的原文段落 ID) |
+| ... | ... | ... | ... |
+| 10 | ... | ... | ... |
+
+**評測流程:**
+
+1. 將 Q 輸入系統。
+2. **Retrieval 檢查**: 系統抓回來的 Context 是否包含 Ground Truth Context？(Hit Rate)
+3. **Generation 檢查**: LLM 生成的答案是否與 Expected Answer 語意一致？(由人工判斷或 LLM-as-a-judge)。
+
+---
+
+## 7. 實作步驟 (Next Steps)
+
+如果您同意這個架構，我建議的實作順序如下：
+
+1. **環境建置**: 設定 Python 環境與 MongoDB Atlas 免費叢集。
+2. **資料準備**: 下載 DRCD，寫程式碼挑選 10 題作為測試集，其餘 (或部分) 作為知識庫入庫。
+3. **入庫腳本**: 實作 Embedding + MongoDB Insert。
+4. **檢索腳本**: 實作 Vector Search + Keyword Search + RRF 融合邏輯。
+5. **串接 LLM**: 完成最終問答。
+
+### 想要我先為您執行哪一步？
+
+1. **撰寫「資料處理與入庫」的 Python 程式碼** (包含下載 DRCD 與 MongoDB 連線設定)。
+2. **撰寫「Hybrid Retrieval (RRF)」的邏輯程式碼**。
+3. **協助挑選並列出那 10 題 DRCD 範例資料**。
