@@ -27,13 +27,66 @@ st.set_page_config(
     layout="wide",
 )
 
-# 初始化 session state
-if "rag_service" not in st.session_state:
-    st.session_state.rag_service = None
-if "results" not in st.session_state:
-    st.session_state.results = {}  # {mode: results}
-if "current_mode" not in st.session_state:
-    st.session_state.current_mode = None
+DATA_DIR = Path("data")
+MODES = ["hybrid", "vector", "keyword"]
+
+
+# ===================== 資料管理 =====================
+
+def get_result_path(mode: str) -> Path:
+    return DATA_DIR / f"rag_results_{mode}.json"
+
+
+def get_metrics_path(mode: str) -> Path:
+    return DATA_DIR / f"evaluation_metrics_{mode}.json"
+
+
+def get_answer_eval_path(mode: str) -> Path:
+    return DATA_DIR / f"answer_evaluation_{mode}.json"
+
+
+def load_existing_results() -> dict:
+    """載入已存在的結果檔案（包含 LLM 評估）"""
+    results = {}
+    
+    for mode in MODES:
+        path = get_result_path(mode)
+        if path.exists():
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            mode_results = data.get("results", data)
+            
+            # 嘗試載入 LLM 評估結果並合併
+            eval_path = get_answer_eval_path(mode)
+            if eval_path.exists():
+                with open(eval_path, "r", encoding="utf-8") as f:
+                    eval_data = json.load(f)
+                eval_results = eval_data.get("results", [])
+                
+                # 建立 question_id -> eval_result 的映射
+                eval_map = {e["question_id"]: e for e in eval_results}
+                
+                # 合併 LLM 評估資料
+                for r in mode_results:
+                    q_id = r.get("question_id")
+                    if q_id and q_id in eval_map:
+                        r["llm_judgment"] = eval_map[q_id].get("llm_judgment")
+                        r["is_pass"] = eval_map[q_id].get("is_pass", False)
+            
+            results[mode] = mode_results
+    
+    return results
+
+
+def save_results(mode: str, results: list[dict], metadata: dict = None):
+    """儲存結果到檔案"""
+    output_data = {
+        "metadata": metadata or {},
+        "results": results,
+    }
+    path = get_result_path(mode)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(output_data, f, ensure_ascii=False, indent=2)
 
 
 def load_queries() -> list[QueryModel]:
@@ -43,18 +96,20 @@ def load_queries() -> list[QueryModel]:
     return [QueryModel(**q) for q in data]
 
 
+# ===================== 評估執行 =====================
+
 def run_evaluation(queries: list[QueryModel], mode: str, top_k: int) -> list[dict]:
     """執行評估"""
-    rag = st.session_state.rag_service
-    if rag is None:
-        rag = RAGService()
-        st.session_state.rag_service = rag
+    if "rag_service" not in st.session_state:
+        st.session_state.rag_service = RAGService()
     
+    rag = st.session_state.rag_service
     rag.initialize(mode=mode)
     
     results = []
     progress_bar = st.progress(0)
     status_text = st.empty()
+    total_time = 0.0
     
     for i, query in enumerate(queries):
         status_text.text(f"處理中: {i+1}/{len(queries)}")
@@ -62,6 +117,7 @@ def run_evaluation(queries: list[QueryModel], mode: str, top_k: int) -> list[dic
         start_time = time.perf_counter()
         response = rag.answer(query.question, top_k=top_k, mode=mode)
         elapsed_time = time.perf_counter() - start_time
+        total_time += elapsed_time
         
         gold_ids = set(query.gold_doc_ids)
         retrieved_ids = set(response.retrieved_doc_ids)
@@ -95,162 +151,334 @@ def run_evaluation(queries: list[QueryModel], mode: str, top_k: int) -> list[dic
         progress_bar.progress((i + 1) / len(queries))
     
     status_text.text("✅ 完成!")
+    
+    # 儲存結果
+    metadata = {
+        "mode": mode,
+        "top_k": top_k,
+        "total_questions": len(results),
+        "total_time_seconds": round(total_time, 2),
+        "avg_response_time_ms": round((total_time / len(results)) * 1000, 2),
+        "timestamp": datetime.now().isoformat(),
+    }
+    save_results(mode, results, metadata)
+    
     return results
 
 
+# ===================== 指標計算 =====================
+
 def calculate_metrics(results: list[dict]) -> dict:
-    """計算指標"""
+    """計算檢索與生成指標"""
     total = len(results)
+    if total == 0:
+        return {}
     
-    # 整體統計
-    total_hits = sum(1 for r in results if r["is_hit"])
-    total_gold_docs = sum(r["gold_count"] for r in results)
-    total_hit_docs = sum(r["hit_count"] for r in results)
-    avg_time = sum(r["response_time_ms"] for r in results) / total if total > 0 else 0
+    # 預處理：計算缺失的欄位
+    for r in results:
+        gold_ids = set(r.get("gold_doc_ids", []))
+        retrieved_ids = set(r.get("retrieved_doc_ids", []))
+        hit_ids = gold_ids.intersection(retrieved_ids)
+        
+        if "hit_count" not in r:
+            r["hit_count"] = len(hit_ids)
+        if "gold_count" not in r:
+            r["gold_count"] = len(gold_ids)
+        if "is_hit" not in r:
+            r["is_hit"] = len(hit_ids) > 0
+    
+    # 檢索指標
+    total_hits = sum(1 for r in results if r.get("is_hit", False))
+    total_gold_docs = sum(r.get("gold_count", 0) for r in results)
+    total_hit_docs = sum(r.get("hit_count", 0) for r in results)
+    avg_time = sum(r.get("response_time_ms", 0) for r in results) / total
     
     # 單一 gold doc 的 hit rate
-    single_gold = [r for r in results if r["gold_count"] == 1]
-    single_hits = sum(1 for r in single_gold if r["is_hit"])
+    single_gold = [r for r in results if r.get("gold_count", 0) == 1]
+    single_hits = sum(1 for r in single_gold if r.get("is_hit", False))
     
-    # MRR
+    # MRR（平均 RR）
     def calc_mrr(results):
         total_rr = 0
         for r in results:
-            gold_ids = set(r["gold_doc_ids"])
+            gold_ids = set(r.get("gold_doc_ids", []))
+            retrieved_ids = r.get("retrieved_doc_ids", [])
             rr_sum = 0
             for gold_id in gold_ids:
-                for rank, doc_id in enumerate(r["retrieved_doc_ids"], start=1):
+                for rank, doc_id in enumerate(retrieved_ids, start=1):
                     if doc_id == gold_id:
                         rr_sum += 1.0 / rank
                         break
             total_rr += rr_sum / len(gold_ids) if gold_ids else 0
         return total_rr / len(results) if results else 0
     
+    # 生成指標（如果有 LLM 評估結果）
+    has_llm_eval = any("is_pass" in r for r in results)
+    if has_llm_eval:
+        passed = sum(1 for r in results if r.get("is_pass", False))
+        pass_rate = passed / total
+    else:
+        passed = None
+        pass_rate = None
+    
     return {
         "total_questions": total,
-        "hit_rate": total_hits / total if total > 0 else 0,
+        "hit_rate": total_hits / total,
         "single_gold_hit_rate": single_hits / len(single_gold) if single_gold else 0,
         "partial_hit_rate": total_hit_docs / total_gold_docs if total_gold_docs > 0 else 0,
         "mrr": calc_mrr(results),
         "avg_response_time_ms": avg_time,
+        # 生成指標
+        "llm_passed": passed,
+        "llm_pass_rate": pass_rate,
     }
 
 
-def display_metrics_comparison():
-    """顯示指標比較"""
-    if not st.session_state.results:
-        st.info("尚無評估結果，請先執行評估。")
+# ===================== LLM 語意評估 =====================
+
+def run_llm_evaluation(results: list[dict], mode: str) -> list[dict]:
+    """執行 LLM 語意評估"""
+    from openai import OpenAI
+    
+    client = OpenAI(api_key=settings.OPENAI_API_KEY)
+    
+    PROMPT = """請判斷「模型回答」是否與「標準答案」語意一致。
+
+問題：{question}
+標準答案：{gold_answer}
+模型回答：{model_answer}
+
+判斷標準：
+- 如果模型回答包含標準答案的核心資訊，且沒有明顯錯誤，請回答 "Pass"
+- 如果模型回答與標準答案語意不一致、有錯誤、或完全無關，請回答 "Fail"
+
+請只回答 "Pass" 或 "Fail"。"""
+    
+    progress_bar = st.progress(0)
+    status_text = st.empty()
+    
+    for i, r in enumerate(results):
+        status_text.text(f"語意評估中: {i+1}/{len(results)}")
+        
+        try:
+            response = client.chat.completions.create(
+                model="gpt-4o-mini",
+                messages=[{"role": "user", "content": PROMPT.format(
+                    question=r["question"],
+                    gold_answer=r.get("gold_answer", ""),
+                    model_answer=r.get("generated_answer", ""),
+                )}],
+                temperature=0,
+                max_tokens=10,
+            )
+            raw = response.choices[0].message.content.strip()
+            r["llm_judgment"] = raw
+            r["is_pass"] = raw.lower() == "pass"
+        except Exception as e:
+            r["llm_judgment"] = f"Error: {e}"
+            r["is_pass"] = False
+        
+        progress_bar.progress((i + 1) / len(results))
+    
+    status_text.text("✅ 語意評估完成!")
+    
+    # 更新儲存
+    save_results(mode, results)
+    
+    return results
+
+
+# ===================== UI 元件 =====================
+
+def display_metrics_comparison(all_results: dict):
+    """顯示指標比較（三模式並排）"""
+    if not all_results:
+        st.info("尚無評估結果。請執行評估或確認 data 目錄中有結果檔案。")
         return
     
-    # 計算各模式指標
-    metrics_data = []
-    for mode, results in st.session_state.results.items():
-        metrics = calculate_metrics(results)
-        metrics["mode"] = mode
-        metrics_data.append(metrics)
-    
-    df = pd.DataFrame(metrics_data)
-    df = df.set_index("mode")
-    
-    # 格式化顯示
     st.subheader("📊 指標比較")
     
-    col1, col2, col3, col4 = st.columns(4)
+    # 計算各模式指標
+    metrics_list = []
+    for mode in MODES:
+        if mode in all_results:
+            m = calculate_metrics(all_results[mode])
+            m["mode"] = mode
+            metrics_list.append(m)
     
-    with col1:
-        st.metric("總題數", df["total_questions"].iloc[0])
-    
-    # 顯示各模式的指標
-    for mode in df.index:
-        st.markdown(f"### {mode.upper()}")
-        cols = st.columns(5)
-        cols[0].metric("Hit Rate", f"{df.loc[mode, 'hit_rate']:.2%}")
-        cols[1].metric("Single Gold Hit Rate", f"{df.loc[mode, 'single_gold_hit_rate']:.2%}")
-        cols[2].metric("Partial Hit Rate", f"{df.loc[mode, 'partial_hit_rate']:.2%}")
-        cols[3].metric("MRR", f"{df.loc[mode, 'mrr']:.4f}")
-        cols[4].metric("Avg Response Time", f"{df.loc[mode, 'avg_response_time_ms']:.0f} ms")
-
-
-def display_results_table(mode: str):
-    """顯示結果表格"""
-    if mode not in st.session_state.results:
+    if not metrics_list:
         return
     
-    results = st.session_state.results[mode]
-    
     # 轉換為 DataFrame
+    df = pd.DataFrame(metrics_list).set_index("mode")
+    
+    # 指標選擇
+    st.markdown("### 選擇指標進行比較")
+    
+    metric_options = {
+        "Hit Rate": "hit_rate",
+        "Single Gold Hit Rate": "single_gold_hit_rate",
+        "Partial Hit Rate": "partial_hit_rate",
+        "MRR": "mrr",
+        "Avg Response Time (ms)": "avg_response_time_ms",
+    }
+    
+    if df["llm_pass_rate"].notna().any():
+        metric_options["LLM Pass Rate"] = "llm_pass_rate"
+    
+    selected_metric = st.selectbox("指標", list(metric_options.keys()))
+    metric_col = metric_options[selected_metric]
+    
+    # 長條圖比較
+    chart_data = df[[metric_col]].dropna()
+    chart_data.columns = [selected_metric]
+    st.bar_chart(chart_data)
+    
+    # 詳細數值表格
+    st.markdown("### 完整指標")
+    
+    display_df = df[["hit_rate", "single_gold_hit_rate", "partial_hit_rate", "mrr", "avg_response_time_ms"]].copy()
+    display_df.columns = ["Hit Rate", "Single Gold HR", "Partial HR", "MRR", "Avg Time (ms)"]
+    
+    # 格式化
+    for col in ["Hit Rate", "Single Gold HR", "Partial HR"]:
+        display_df[col] = display_df[col].apply(lambda x: f"{x:.2%}" if pd.notna(x) else "-")
+    display_df["MRR"] = display_df["MRR"].apply(lambda x: f"{x:.4f}" if pd.notna(x) else "-")
+    display_df["Avg Time (ms)"] = display_df["Avg Time (ms)"].apply(lambda x: f"{x:.0f}" if pd.notna(x) else "-")
+    
+    if "llm_pass_rate" in df.columns:
+        display_df["LLM Pass Rate"] = df["llm_pass_rate"].apply(lambda x: f"{x:.2%}" if pd.notna(x) else "-")
+    
+    st.dataframe(display_df.T, use_container_width=True)
+
+
+def display_results_table(mode: str, results: list[dict]):
+    """顯示結果表格"""
+    # 預處理欄位
+    for r in results:
+        if "partial_hit" not in r:
+            gold_ids = set(r.get("gold_doc_ids", []))
+            retrieved_ids = set(r.get("retrieved_doc_ids", []))
+            hit_count = len(gold_ids.intersection(retrieved_ids))
+            r["partial_hit"] = f"{hit_count}/{len(gold_ids)}"
+            r["is_hit"] = hit_count > 0
+    
     df = pd.DataFrame([
         {
-            "ID": r["question_id"][:8],
-            "問題": r["question"][:50] + "..." if len(r["question"]) > 50 else r["question"],
-            "類型": r["question_type"],
-            "來源": r["source_dataset"],
-            "命中": r["partial_hit"],
-            "是否命中": "✅" if r["is_hit"] else "❌",
-            "時間(ms)": r["response_time_ms"],
+            "ID": r.get("question_id", "")[:8],
+            "問題": (r.get("question", "")[:40] + "...") if len(r.get("question", "")) > 40 else r.get("question", ""),
+            "類型": r.get("question_type", "-"),
+            "來源": r.get("source_dataset", "-"),
+            "命中": r.get("partial_hit", "-"),
+            "Hit": "✅" if r.get("is_hit") else "❌",
+            "LLM": "✅" if r.get("is_pass") else ("❌" if "is_pass" in r else "-"),
+            "Time(ms)": r.get("response_time_ms", 0),
         }
         for r in results
     ])
     
-    st.dataframe(df, use_container_width=True)
+    st.dataframe(df, use_container_width=True, height=400)
 
 
-def display_question_detail(mode: str, question_idx: int):
+def display_question_detail(results: list[dict], question_idx: int):
     """顯示問題詳情"""
-    if mode not in st.session_state.results:
-        return
+    result = results[question_idx]
     
-    result = st.session_state.results[mode][question_idx]
-    
-    st.markdown("---")
-    st.subheader(f"📝 問題詳情")
+    # 預處理欄位
+    gold_ids = set(result.get("gold_doc_ids", []))
+    retrieved_ids = result.get("retrieved_doc_ids", [])
     
     col1, col2 = st.columns(2)
     
     with col1:
         st.markdown("**問題:**")
-        st.write(result["question"])
+        st.write(result.get("question", ""))
         
         st.markdown("**標準答案:**")
-        st.info(result["gold_answer"])
+        st.info(result.get("gold_answer", "-"))
         
         st.markdown("**模型回答:**")
-        st.success(result["generated_answer"])
+        answer = result.get("generated_answer", "-")
+        if result.get("is_pass"):
+            st.success(answer)
+        elif "is_pass" in result:
+            st.error(answer)
+        else:
+            st.write(answer)
+        
+        if "llm_judgment" in result:
+            st.markdown(f"**LLM 判斷:** {result['llm_judgment']}")
     
     with col2:
+        # 計算命中
+        hit_ids = gold_ids.intersection(retrieved_ids)
+        partial_hit = f"{len(hit_ids)}/{len(gold_ids)}"
+        
+        st.markdown("**統計:**")
+        st.write(f"- 命中: {partial_hit}")
+        st.write(f"- 回應時間: {result.get('response_time_ms', 0)} ms")
+        
         st.markdown("**Gold Doc IDs:**")
-        for doc_id in result["gold_doc_ids"]:
-            st.code(doc_id)
         
-        st.markdown("**檢索結果:**")
-        st.write(f"命中: {result['partial_hit']}")
+        # 從資料庫載入 gold doc 內容
+        from repositories.document_repository import DocumentRepository
+        repo = DocumentRepository()
         
+        for doc_id in result.get("gold_doc_ids", []):
+            is_hit = doc_id in retrieved_ids
+            icon = "✅" if is_hit else "❌"
+            
+            with st.expander(f"{icon} {doc_id[:20]}..."):
+                # 嘗試從檢索結果中找內容
+                ctx_content = None
+                for ctx in result.get("contexts", result.get("retrieved_contexts", [])):
+                    if ctx.get("doc_id") == doc_id:
+                        ctx_content = ctx.get("content", ctx.get("content_preview"))
+                        break
+                
+                if ctx_content:
+                    st.write(ctx_content)
+                else:
+                    # 從資料庫查詢
+                    doc = repo.find_by_doc_id(doc_id)
+                    if doc:
+                        st.write(doc.get("content", "無內容"))
+                    else:
+                        st.write("找不到此文件")
+    
     # 檢索到的文件
-    st.markdown("### 📚 檢索到的文件")
-    for i, ctx in enumerate(result["contexts"]):
-        is_gold = ctx["doc_id"] in result["gold_doc_ids"]
-        icon = "🎯" if is_gold else "📄"
-        
-        with st.expander(f"{icon} [{i+1}] {ctx['doc_id'][:16]}... (Score: {ctx['score']:.4f})"):
-            st.markdown(f"**來源:** {ctx['original_source']}")
-            st.markdown("**內容:**")
-            st.write(ctx["content"])
+    contexts = result.get("contexts", result.get("retrieved_contexts", []))
+    if contexts:
+        st.markdown("### 📚 檢索到的文件")
+        for i, ctx in enumerate(contexts):
+            doc_id = ctx.get("doc_id", "unknown")
+            is_gold = doc_id in gold_ids
+            icon = "🎯" if is_gold else "📄"
+            score = ctx.get("score", 0)
+            
+            with st.expander(f"{icon} [{i+1}] {doc_id[:16]}... (Score: {score:.4f})"):
+                st.markdown(f"**來源:** {ctx.get('original_source', '-')}")
+                content = ctx.get("content", ctx.get("content_preview", "-"))
+                st.write(content)
 
+
+# ===================== 主程式 =====================
 
 def main():
     st.title("🔍 Hybrid RAG 評估儀表板")
+    
+    # 載入已存在的結果
+    if "results" not in st.session_state:
+        st.session_state.results = load_existing_results()
     
     # 側邊欄
     with st.sidebar:
         st.header("⚙️ 設定")
         
-        mode = st.selectbox(
-            "檢索模式",
-            ["hybrid", "vector", "keyword"],
-            index=0,
-        )
-        
+        mode = st.selectbox("檢索模式", MODES, index=0)
         top_k = st.slider("Top-K", min_value=1, max_value=20, value=5)
+        
+        st.markdown("---")
         
         if st.button("🚀 執行評估", type="primary", use_container_width=True):
             with st.spinner("載入查詢..."):
@@ -259,51 +487,64 @@ def main():
             st.info(f"正在以 {mode} 模式執行 {len(queries)} 題...")
             results = run_evaluation(queries, mode, top_k)
             st.session_state.results[mode] = results
-            st.session_state.current_mode = mode
+            st.rerun()
+        
+        if st.button("🔬 執行 LLM 語意評估", use_container_width=True):
+            if mode in st.session_state.results:
+                results = run_llm_evaluation(st.session_state.results[mode], mode)
+                st.session_state.results[mode] = results
+                st.rerun()
+            else:
+                st.warning("請先執行評估")
+        
+        if st.button("🔄 重新載入資料", use_container_width=True):
+            st.session_state.results = load_existing_results()
             st.rerun()
         
         st.markdown("---")
-        st.markdown("### 已完成的評估")
-        for m in st.session_state.results.keys():
-            st.write(f"✅ {m}")
+        st.markdown("### 已有結果")
+        for m in MODES:
+            if m in st.session_state.results:
+                count = len(st.session_state.results[m])
+                has_llm = any("is_pass" in r for r in st.session_state.results[m])
+                llm_icon = "🔬" if has_llm else ""
+                st.write(f"✅ {m} ({count}題) {llm_icon}")
+            else:
+                st.write(f"⬜ {m}")
     
     # 主區域
     tab1, tab2, tab3 = st.tabs(["📊 指標比較", "📋 結果列表", "🔎 問題詳情"])
     
     with tab1:
-        display_metrics_comparison()
+        display_metrics_comparison(st.session_state.results)
     
     with tab2:
         if st.session_state.results:
-            selected_mode = st.selectbox(
-                "選擇模式",
-                list(st.session_state.results.keys()),
-                key="results_mode"
-            )
-            display_results_table(selected_mode)
+            available_modes = [m for m in MODES if m in st.session_state.results]
+            selected_mode = st.selectbox("選擇模式", available_modes, key="results_mode")
+            display_results_table(selected_mode, st.session_state.results[selected_mode])
         else:
-            st.info("請先執行評估。")
+            st.info("請先執行評估或確認 data 目錄中有結果檔案。")
     
     with tab3:
         if st.session_state.results:
+            available_modes = [m for m in MODES if m in st.session_state.results]
+            
             col1, col2 = st.columns([1, 3])
             
             with col1:
-                selected_mode = st.selectbox(
-                    "模式",
-                    list(st.session_state.results.keys()),
-                    key="detail_mode"
-                )
+                selected_mode = st.selectbox("模式", available_modes, key="detail_mode")
+                results = st.session_state.results[selected_mode]
                 
                 question_options = [
-                    f"{i+1}. {r['question'][:30]}..."
-                    for i, r in enumerate(st.session_state.results[selected_mode])
+                    f"{i+1}. {r['question'][:25]}..."
+                    for i, r in enumerate(results)
                 ]
                 selected_q = st.selectbox("選擇問題", question_options, key="detail_q")
                 question_idx = question_options.index(selected_q)
             
             with col2:
-                display_question_detail(selected_mode, question_idx)
+                display_question_detail(results, question_idx)
         else:
             st.info("請先執行評估。")
 
