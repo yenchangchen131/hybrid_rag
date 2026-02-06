@@ -39,11 +39,21 @@ class DocumentRepository:
         Returns:
             成功插入的數量
         """
+        from pymongo.errors import BulkWriteError
+        
         if not documents:
             return 0
-            
-        result = self.collection.insert_many(documents)
-        return len(result.inserted_ids)
+        
+        try:
+            # ordered=False: 即使有重複也繼續插入其他文件
+            result = self.collection.insert_many(documents, ordered=False)
+            return len(result.inserted_ids)
+        except BulkWriteError as e:
+            # 回傳實際成功插入的數量
+            inserted = e.details.get("nInserted", 0)
+            errors = len(e.details.get("writeErrors", []))
+            print(f"⚠️ 插入時有 {errors} 筆錯誤（重複或其他），成功 {inserted} 筆")
+            return inserted
     
     def find_by_doc_id(self, doc_id: str) -> dict[str, Any] | None:
         """根據 doc_id 查詢文件"""
