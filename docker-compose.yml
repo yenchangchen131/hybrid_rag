@@ -1,5 +1,7 @@
 version: '3.8'
+
 services:
+  # MongoDB 資料庫
   mongodb:
     image: mongo:latest
     container_name: hybrid_rag_mongo
@@ -8,3 +10,26 @@ services:
     volumes:
       - ./mongodb_data:/data/db
     restart: always
+    healthcheck:
+      test: [ "CMD", "mongosh", "--eval", "db.adminCommand('ping')" ]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+  # RAG 應用 (可選，用於容器化部署)
+  # app:
+  #   build: .
+  #   container_name: hybrid_rag_app
+  #   depends_on:
+  #     mongodb:
+  #       condition: service_healthy
+  #   env_file:
+  #     - .env
+  #   environment:
+  #     - MONGODB_HOST=mongodb
+  #   volumes:
+  #     - ./data:/app/data
+  #   restart: unless-stopped
+
+networks:
+  default:
+    name: hybrid_rag_network
