@@ -4,37 +4,10 @@
 
 ## 🌟 核心特色
 
-- **多模式檢索**: vector / keyword / hybrid
+- **多模式檢索**: vector / keyword / hybrid (RRF Fusion)
 - **完整評估系統**: 檢索指標 + LLM 語意評估
-- **Streamlit 儀表板**: 視覺化比較各模式效能
+- **Streamlit 儀表板**: 視覺化比較、分組統計
 - **多資料源**: DRCD、SQuAD、HotpotQA、2WikiMultiHopQA
-
-## 📁 專案結構
-
-```
-hybrid_rag/
-├── core/                        # 配置、資料庫、日誌
-├── models/                      # Pydantic 資料模型
-├── repositories/                # 資料庫操作層
-├── services/                    # 業務邏輯層
-│   ├── retrieval_service.py     # 檢索服務（支援多模式）
-│   ├── generation_service.py    # 生成服務
-│   └── rag_service.py           # RAG 整合服務
-├── scripts/
-│   ├── ingest_data.py           # 資料導入
-│   ├── run_query.py             # 單一查詢
-│   ├── run_all_queries.py       # 批次查詢
-│   ├── calculate_metrics.py     # 計算檢索指標
-│   └── evaluate_answers.py      # LLM 語意評估
-├── data/
-│   ├── corpus.json              # 文件語料庫
-│   ├── queries.json             # 測試問題集
-│   ├── rag_results_{mode}.json  # 各模式 RAG 結果
-│   ├── evaluation_metrics_{mode}.json
-│   └── answer_evaluation_{mode}.json
-├── app.py                       # Streamlit 儀表板
-└── main.py                      # CLI 互動問答
-```
 
 ## 🚀 快速開始
 
@@ -51,27 +24,47 @@ uv run python scripts/ingest_data.py
 uv run streamlit run app.py
 ```
 
-| 功能 | 說明 |
-|------|------|
-| 模式選擇 | hybrid / vector / keyword |
-| 批次評估 | 執行 50 題並儲存結果 |
-| LLM 評估 | GPT-4o-mini 判斷答案正確性 |
-| 指標比較 | 三模式長條圖比較 |
-| 問題詳情 | 展開查看 Gold Docs 內容 |
+| Tab | 功能 |
+|-----|------|
+| 📊 模式比較 | 三模式長條圖 + 完整指標表 |
+| 📋 詳細報告 | 按資料來源/問題類型分組統計 |
+| 📋 結果列表 | 各模式的問題列表與命中狀態 |
+| 🔎 問題詳情 | Gold Docs 內容展開、檢索結果詳情 |
 
-## 📊 CLI 評估流程
+## 📊 CLI 評估
 
 ```bash
-# 1. 批次執行（自動儲存 response_time_ms）
+# 1. 批次執行
 uv run python scripts/run_all_queries.py --mode hybrid
-uv run python scripts/run_all_queries.py --mode vector
-uv run python scripts/run_all_queries.py --mode keyword
 
 # 2. 計算檢索指標
 uv run python scripts/calculate_metrics.py -i data/rag_results_hybrid.json
 
-# 3. LLM 語意評估（選用）
+# 3. LLM 語意評估
 uv run python scripts/evaluate_answers.py -i data/rag_results_hybrid.json
+```
+
+### CLI 輸出範例
+
+```
+==================================================
+按資料來源分組
+==================================================
+
+【drcd】
+  問題數:           20
+  Hit Rate:         100.00%
+  Partial Hit Rate: 100.00% (20/20)
+  MRR:              0.9100
+
+==================================================
+總計
+==================================================
+
+  問題數:           60
+  Hit Rate:         100.00%
+  Partial Hit Rate: 83.96% (89/106)
+  MRR:              0.6566
 ```
 
 ## 📈 評估指標
@@ -79,15 +72,35 @@ uv run python scripts/evaluate_answers.py -i data/rag_results_hybrid.json
 | 指標 | 說明 |
 |------|------|
 | Hit Rate | 單一 gold doc 問題的命中率 |
-| Partial Hit Rate | 命中的 gold docs / 總 gold docs |
+| Partial Hit Rate | 命中數/總 gold docs (如 89/106) |
 | MRR | 平均 Reciprocal Rank（多 gold doc 取平均） |
-| LLM Pass Rate | GPT-4o-mini 判斷語意一致的比例 |
+| LLM Pass Rate | GPT-4o-mini 語意判斷通過率 |
 | Response Time | 每題回應時間 (ms) |
+
+## 📁 專案結構
+
+```
+hybrid_rag/
+├── core/                    # 配置、資料庫、日誌
+├── models/                  # Pydantic 資料模型
+├── repositories/            # 資料庫操作層
+├── services/                # 業務邏輯層
+├── scripts/
+│   ├── ingest_data.py
+│   ├── run_all_queries.py
+│   ├── calculate_metrics.py
+│   └── evaluate_answers.py
+├── data/
+│   ├── corpus.json
+│   ├── queries.json
+│   └── rag_results_{mode}.json
+├── app.py                   # Streamlit 儀表板
+└── main.py                  # CLI 互動問答
+```
 
 ## 🛠 開發
 
 ```bash
 uv sync --extra dev   # 開發依賴
-uv sync --extra api   # FastAPI
 uv sync --extra ui    # Streamlit
 ```

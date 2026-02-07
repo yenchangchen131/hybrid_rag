@@ -179,50 +179,40 @@ def print_metrics(metrics: dict) -> None:
     """輸出指標"""
     summary = metrics["summary"]
     
-    print("\n" + "=" * 60)
-    print("📊 整體統計")
-    print("=" * 60)
-    print(f"總問題數:              {summary['total_questions']}")
-    
-    print("\n【單一 Gold Doc 問題】（Hit Rate）")
-    if summary["single_gold_hit_rate"] is not None:
-        print(f"  問題數:              {summary['single_gold_questions']}")
-        print(f"  Hit Rate:            {summary['single_gold_hit_rate']:.2%}")
-    else:
-        print("  (無單一 gold doc 的問題)")
-    
-    print("\n【多 Gold Docs 問題】（Partial Hit Rate）")
-    print(f"  問題數:              {summary['multi_gold_questions']}")
-    print(f"  總 Gold Docs:        {summary['total_gold_docs']}")
-    print(f"  命中 Gold Docs:      {summary['total_hit_docs']}")
-    print(f"  Partial Hit Rate:    {summary['partial_hit_rate']:.2%}")
-    
-    print("\n【排序精準度】")
-    print(f"  MRR (Mean Reciprocal Rank): {summary['mrr']:.4f}")
-    
-    print("\n" + "=" * 60)
-    print("📈 按問題類型分組")
-    print("=" * 60)
-    for q_type, stats in metrics["by_question_type"].items():
-        print(f"\n【{q_type}】")
-        print(f"  問題數:           {stats['total_questions']}")
-        if "single_gold_hit_rate" in stats:
-            print(f"  Hit Rate (單一):  {stats['single_gold_hit_rate']:.2%} ({stats.get('single_gold_questions', 0)} 題)")
-        print(f"  Partial Hit Rate: {stats['partial_hit_rate']:.2%} ({stats['total_hit_docs']}/{stats['total_gold_docs']})")
-        print(f"  MRR:              {stats['mrr']:.4f}")
-    
-    print("\n" + "=" * 60)
-    print("📚 按資料來源分組")
-    print("=" * 60)
+    # 按資料來源分組
+    print("\n" + "=" * 50)
+    print("按資料來源分組")
+    print("=" * 50)
     for source, stats in metrics["by_source"].items():
         print(f"\n【{source}】")
         print(f"  問題數:           {stats['total_questions']}")
         if "single_gold_hit_rate" in stats:
-            print(f"  Hit Rate (單一):  {stats['single_gold_hit_rate']:.2%} ({stats.get('single_gold_questions', 0)} 題)")
+            print(f"  Hit Rate:         {stats['single_gold_hit_rate']:.2%}")
         print(f"  Partial Hit Rate: {stats['partial_hit_rate']:.2%} ({stats['total_hit_docs']}/{stats['total_gold_docs']})")
         print(f"  MRR:              {stats['mrr']:.4f}")
     
-    print("\n" + "=" * 60)
+    # 按問題類型分組
+    print("\n" + "=" * 50)
+    print("按問題類型分組")
+    print("=" * 50)
+    for q_type, stats in metrics["by_question_type"].items():
+        print(f"\n【{q_type}】")
+        print(f"  問題數:           {stats['total_questions']}")
+        if "single_gold_hit_rate" in stats:
+            print(f"  Hit Rate:         {stats['single_gold_hit_rate']:.2%}")
+        print(f"  Partial Hit Rate: {stats['partial_hit_rate']:.2%} ({stats['total_hit_docs']}/{stats['total_gold_docs']})")
+        print(f"  MRR:              {stats['mrr']:.4f}")
+    
+    # 總計
+    print("\n" + "=" * 50)
+    print("總計")
+    print("=" * 50)
+    print(f"\n  問題數:           {summary['total_questions']}")
+    if summary["single_gold_hit_rate"] is not None:
+        print(f"  Hit Rate:         {summary['single_gold_hit_rate']:.2%}")
+    print(f"  Partial Hit Rate: {summary['partial_hit_rate']:.2%} ({summary['total_hit_docs']}/{summary['total_gold_docs']})")
+    print(f"  MRR:              {summary['mrr']:.4f}")
+    print("")
 
 
 def main():

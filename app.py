@@ -290,66 +290,162 @@ def run_llm_evaluation(results: list[dict], mode: str) -> list[dict]:
 
 # ===================== UI 元件 =====================
 
+def calculate_grouped_metrics(results: list[dict]) -> dict:
+    """計算分組指標"""
+    from collections import defaultdict
+    
+    # 預處理
+    for r in results:
+        gold_ids = set(r.get("gold_doc_ids", []))
+        retrieved_ids = set(r.get("retrieved_doc_ids", []))
+        hit_ids = gold_ids.intersection(retrieved_ids)
+        r["hit_count"] = len(hit_ids)
+        r["gold_count"] = len(gold_ids)
+        r["is_hit"] = len(hit_ids) > 0
+    
+    def calc_mrr(subset):
+        total_rr = 0
+        for r in subset:
+            gold_ids = set(r.get("gold_doc_ids", []))
+            retrieved_ids = r.get("retrieved_doc_ids", [])
+            rr_sum = 0
+            for gold_id in gold_ids:
+                for rank, doc_id in enumerate(retrieved_ids, start=1):
+                    if doc_id == gold_id:
+                        rr_sum += 1.0 / rank
+                        break
+            total_rr += rr_sum / len(gold_ids) if gold_ids else 0
+        return total_rr / len(subset) if subset else 0
+    
+    def calc_group(subset):
+        total = len(subset)
+        gold_docs = sum(r["gold_count"] for r in subset)
+        hit_docs = sum(r["hit_count"] for r in subset)
+        single_gold = [r for r in subset if r["gold_count"] == 1]
+        single_hits = sum(1 for r in single_gold if r["is_hit"])
+        return {
+            "total": total,
+            "gold_docs": gold_docs,
+            "hit_docs": hit_docs,
+            "partial_hit_rate": hit_docs / gold_docs if gold_docs > 0 else 0,
+            "hit_rate": single_hits / len(single_gold) if single_gold else None,
+            "mrr": calc_mrr(subset),
+        }
+    
+    # 按資料來源分組
+    by_source = defaultdict(list)
+    for r in results:
+        by_source[r.get("source_dataset", "unknown")].append(r)
+    
+    # 按問題類型分組
+    by_type = defaultdict(list)
+    for r in results:
+        by_type[r.get("question_type", "unknown")].append(r)
+    
+    return {
+        "by_source": {k: calc_group(v) for k, v in by_source.items()},
+        "by_type": {k: calc_group(v) for k, v in by_type.items()},
+        "total": calc_group(results),
+    }
+
+
 def display_metrics_comparison(all_results: dict):
     """顯示指標比較（三模式並排）"""
     if not all_results:
         st.info("尚無評估結果。請執行評估或確認 data 目錄中有結果檔案。")
         return
     
-    st.subheader("📊 指標比較")
+    # 選擇模式
+    available_modes = [m for m in MODES if m in all_results]
     
-    # 計算各模式指標
-    metrics_list = []
-    for mode in MODES:
-        if mode in all_results:
-            m = calculate_metrics(all_results[mode])
-            m["mode"] = mode
-            metrics_list.append(m)
+    # Tab: 比較圖表 vs 詳細報告
+    sub_tab1, sub_tab2 = st.tabs(["📊 模式比較", "📋 詳細報告"])
     
-    if not metrics_list:
-        return
+    with sub_tab1:
+        st.subheader("📊 三模式指標比較")
+        
+        # 計算各模式指標
+        metrics_list = []
+        for mode in MODES:
+            if mode in all_results:
+                m = calculate_metrics(all_results[mode])
+                m["mode"] = mode
+                metrics_list.append(m)
+        
+        if not metrics_list:
+            return
+        
+        df = pd.DataFrame(metrics_list).set_index("mode")
+        
+        # 指標選擇
+        metric_options = {
+            "Hit Rate": "hit_rate",
+            "Partial Hit Rate": "partial_hit_rate",
+            "MRR": "mrr",
+            "Avg Response Time (ms)": "avg_response_time_ms",
+        }
+        if df["llm_pass_rate"].notna().any():
+            metric_options["LLM Pass Rate"] = "llm_pass_rate"
+        
+        selected_metric = st.selectbox("選擇指標", list(metric_options.keys()))
+        metric_col = metric_options[selected_metric]
+        
+        # 長條圖
+        chart_data = df[[metric_col]].dropna()
+        chart_data.columns = [selected_metric]
+        st.bar_chart(chart_data)
+        
+        # 完整表格
+        st.markdown("### 完整指標表")
+        display_df = df[["hit_rate", "partial_hit_rate", "mrr", "avg_response_time_ms"]].copy()
+        display_df.columns = ["Hit Rate", "Partial HR", "MRR", "Avg Time (ms)"]
+        for col in ["Hit Rate", "Partial HR"]:
+            display_df[col] = display_df[col].apply(lambda x: f"{x:.2%}" if pd.notna(x) else "-")
+        display_df["MRR"] = display_df["MRR"].apply(lambda x: f"{x:.4f}" if pd.notna(x) else "-")
+        display_df["Avg Time (ms)"] = display_df["Avg Time (ms)"].apply(lambda x: f"{x:.0f}" if pd.notna(x) else "-")
+        if "llm_pass_rate" in df.columns:
+            display_df["LLM Pass Rate"] = df["llm_pass_rate"].apply(lambda x: f"{x:.2%}" if pd.notna(x) else "-")
+        st.dataframe(display_df.T, width="stretch")
     
-    # 轉換為 DataFrame
-    df = pd.DataFrame(metrics_list).set_index("mode")
-    
-    # 指標選擇
-    st.markdown("### 選擇指標進行比較")
-    
-    metric_options = {
-        "Hit Rate": "hit_rate",
-        "Single Gold Hit Rate": "single_gold_hit_rate",
-        "Partial Hit Rate": "partial_hit_rate",
-        "MRR": "mrr",
-        "Avg Response Time (ms)": "avg_response_time_ms",
-    }
-    
-    if df["llm_pass_rate"].notna().any():
-        metric_options["LLM Pass Rate"] = "llm_pass_rate"
-    
-    selected_metric = st.selectbox("指標", list(metric_options.keys()))
-    metric_col = metric_options[selected_metric]
-    
-    # 長條圖比較
-    chart_data = df[[metric_col]].dropna()
-    chart_data.columns = [selected_metric]
-    st.bar_chart(chart_data)
-    
-    # 詳細數值表格
-    st.markdown("### 完整指標")
-    
-    display_df = df[["hit_rate", "single_gold_hit_rate", "partial_hit_rate", "mrr", "avg_response_time_ms"]].copy()
-    display_df.columns = ["Hit Rate", "Single Gold HR", "Partial HR", "MRR", "Avg Time (ms)"]
-    
-    # 格式化
-    for col in ["Hit Rate", "Single Gold HR", "Partial HR"]:
-        display_df[col] = display_df[col].apply(lambda x: f"{x:.2%}" if pd.notna(x) else "-")
-    display_df["MRR"] = display_df["MRR"].apply(lambda x: f"{x:.4f}" if pd.notna(x) else "-")
-    display_df["Avg Time (ms)"] = display_df["Avg Time (ms)"].apply(lambda x: f"{x:.0f}" if pd.notna(x) else "-")
-    
-    if "llm_pass_rate" in df.columns:
-        display_df["LLM Pass Rate"] = df["llm_pass_rate"].apply(lambda x: f"{x:.2%}" if pd.notna(x) else "-")
-    
-    st.dataframe(display_df.T, use_container_width=True)
+    with sub_tab2:
+        selected_mode = st.selectbox("選擇模式查看詳細", available_modes, key="detail_metrics_mode")
+        results = all_results[selected_mode]
+        grouped = calculate_grouped_metrics(results)
+        
+        # 按資料來源
+        st.markdown("### 📚 按資料來源分組")
+        source_data = []
+        for source, stats in grouped["by_source"].items():
+            source_data.append({
+                "來源": source,
+                "問題數": stats["total"],
+                "Hit Rate": f"{stats['hit_rate']:.2%}" if stats['hit_rate'] else "-",
+                "Partial HR": f"{stats['partial_hit_rate']:.2%} ({stats['hit_docs']}/{stats['gold_docs']})",
+                "MRR": f"{stats['mrr']:.4f}",
+            })
+        st.dataframe(pd.DataFrame(source_data), width="stretch", hide_index=True)
+        
+        # 按問題類型
+        st.markdown("### 📈 按問題類型分組")
+        type_data = []
+        for q_type, stats in grouped["by_type"].items():
+            type_data.append({
+                "類型": q_type,
+                "問題數": stats["total"],
+                "Hit Rate": f"{stats['hit_rate']:.2%}" if stats['hit_rate'] else "-",
+                "Partial HR": f"{stats['partial_hit_rate']:.2%} ({stats['hit_docs']}/{stats['gold_docs']})",
+                "MRR": f"{stats['mrr']:.4f}",
+            })
+        st.dataframe(pd.DataFrame(type_data), width="stretch", hide_index=True)
+        
+        # 總計
+        st.markdown("### 📊 總計")
+        total = grouped["total"]
+        col1, col2, col3, col4 = st.columns(4)
+        col1.metric("問題數", total["total"])
+        col2.metric("Hit Rate", f"{total['hit_rate']:.2%}" if total['hit_rate'] else "-")
+        col3.metric("Partial HR", f"{total['partial_hit_rate']:.2%} ({total['hit_docs']}/{total['gold_docs']})")
+        col4.metric("MRR", f"{total['mrr']:.4f}")
 
 
 def display_results_table(mode: str, results: list[dict]):
@@ -377,7 +473,7 @@ def display_results_table(mode: str, results: list[dict]):
         for r in results
     ])
     
-    st.dataframe(df, use_container_width=True, height=400)
+    st.dataframe(df, width="stretch", height=400)
 
 
 def display_question_detail(results: list[dict], question_idx: int):
@@ -480,7 +576,7 @@ def main():
         
         st.markdown("---")
         
-        if st.button("🚀 執行評估", type="primary", use_container_width=True):
+        if st.button("🚀 執行評估", type="primary", use_container_width=True):  # TODO: width param for button
             with st.spinner("載入查詢..."):
                 queries = load_queries()
             
@@ -489,7 +585,7 @@ def main():
             st.session_state.results[mode] = results
             st.rerun()
         
-        if st.button("🔬 執行 LLM 語意評估", use_container_width=True):
+        if st.button("🔬 執行 LLM 語意評估", use_container_width=True):  # TODO: width param for button
             if mode in st.session_state.results:
                 results = run_llm_evaluation(st.session_state.results[mode], mode)
                 st.session_state.results[mode] = results
@@ -497,7 +593,7 @@ def main():
             else:
                 st.warning("請先執行評估")
         
-        if st.button("🔄 重新載入資料", use_container_width=True):
+        if st.button("🔄 重新載入資料", use_container_width=True):  # TODO: width param for button
             st.session_state.results = load_existing_results()
             st.rerun()
         
